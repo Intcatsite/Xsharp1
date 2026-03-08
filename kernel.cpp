@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <vector>
 #include <cstdlib>
 #include <ctime>
 
@@ -30,14 +31,34 @@ string escapeString(const string &s) {
     return result;
 }
 
-void cleanup(ofstream &out) {
-    out.close();
-    system(CLEANUP);
+struct Function {
+    string name;
+    vector<string> body;
+};
+
+void parseCondition(const string &line, string &vName, string &op, string &vVal) {
+    size_t cs = line.find("check(\"") + 7;
+    struct { const char* tok; const char* oper; int len; } ops[] = {
+        {"\"!=\"", "!=", 4}, {"\">=\"", ">=", 4}, {"\"<=\"", "<=", 4},
+        {"\">\"", ">", 3}, {"\"<\"", "<", 3}, {"\"=\"", "==", 3}
+    };
+    for (auto &o : ops) {
+        size_t p = line.find(o.tok, cs);
+        if (p != string::npos) {
+            op = o.oper;
+            vName = line.substr(cs, p - cs);
+            size_t vs = p + o.len;
+            size_t ve = line.find("\")", vs);
+            vVal = line.substr(vs, ve - vs);
+            return;
+        }
+    }
+    op = "=="; vName = ""; vVal = "0";
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 3 || string(argv[1]) != "play") {
-        cout << "Usage: csharp1 play <filename.xs>\n";
+        cout << "Usage: xsharp play <filename.xs>\n";
         return 1;
     }
 
@@ -47,115 +68,268 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    vector<string> lines;
+    string tmp;
+    while (getline(in, tmp)) {
+        trim(tmp);
+        lines.push_back(tmp);
+    }
+    in.close();
+
+    vector<Function> functions;
+    vector<string> mainCode;
+    bool inFunc = false;
+    string curFuncName;
+    vector<string> curFuncBody;
+
+    for (size_t i = 0; i < lines.size(); i++) {
+        string &line = lines[i];
+        if (line.empty() || line.find("type=comments") != string::npos || line.find("!") == 0) continue; // Добавил ! как коммент из старого синтаксиса
+        if (line.find("func.create(") == 0) {
+            inFunc = true;
+            size_t ns = line.find("name=\"") + 6;
+            curFuncName = line.substr(ns, line.find('"', ns) - ns);
+            curFuncBody.clear();
+            continue;
+        }
+        if (line.find("end.func") == 0) {
+            Function f; f.name = curFuncName; f.body = curFuncBody;
+            functions.push_back(f);
+            inFunc = false;
+            continue;
+        }
+        if (inFunc) curFuncBody.push_back(line);
+        else mainCode.push_back(line);
+    }
+
     ofstream out("temp_output.cpp");
-    out << "#include <iostream>\n#include <string>\n#include <cstdlib>\n#include <ctime>\nusing namespace std;\n\nint main() {\n";
+    out << "#include <iostream>\n#include <string>\n#include <cstdlib>\n#include <ctime>\nusing namespace std;\n\n";
 
-    bool randomAllowed = false;
-    int braceDepth = 0;
-    string line;
+    int depth = 0;
 
-    while (getline(in, line)) {
-        trim(line);
-        if (line.empty() || line.find("type=comments") != string::npos) continue;
+    auto emitLine = [&](const string &line) {
+        if (line.find("end.block") == 0 || line.find("end.loop") == 0 || line.find("end.repeat") == 0) {
+            if (depth > 0) depth--;
+            out << string((depth + 1) * 4, ' ') << "}\n";
+            return;
+        }
+        if (line.find("???:") == 0 || line.find("else:") == 0) {
+            out << string(depth * 4, ' ') << "} else {\n";
+            return;
+        }
+
+        string pad((depth + 1) * 4, ' ');
+
+        // --- БЛОК СТАРОГО СИНТАКСИСА (пасхалка для ленивых) ---
+        if (line.find("print(text=\"") == 0) {
+            size_t s = line.find("text=\"") + 6;
+            size_t e = line.rfind("\")");
+            out << pad << "cout << \"" << escapeString(line.substr(s, e - s)) << "\" << endl;\n";
+            return;
+        }
+        else if (line.find("print(var=\"") == 0) {
+            size_t s = line.find("var=\"") + 5;
+            size_t e = line.rfind("\")");
+            out << pad << "cout << " << line.substr(s, e - s) << " << endl;\n";
+            return;
+        }
+        else if (line.find("repeat(") == 0) {
+            size_t s = line.find("(") + 1;
+            size_t e = line.find("):");
+            string count = line.substr(s, e - s);
+            out << pad << "for (int i_rep = 0; i_rep < " << count << "; i_rep++) {\n";
+            depth++;
+            return;
+        }
+        // --------------------------------------------------------
 
         if (line.find("give.me(type_give=module(random))") != string::npos) {
-            randomAllowed = true;
-            out << "    srand(time(0));\n";
-            continue;
+            out << pad << "srand(time(0));\n";
         }
+        else if (line.find("var(") == 0) {
+            size_t ns = line.find("name=\"") + 6;
+            size_t ne = line.find('"', ns);
+            string vn = line.substr(ns, ne - ns);
 
-        if (line.find("end.block") == 0) {
-            if (braceDepth > 0) {
-                braceDepth--;
-                out << "    }\n";
-            }
-            continue;
-        }
-
-        if (line.find("var(") == 0) {
             if (line.find("module.random") != string::npos) {
-                if (!randomAllowed) {
-                    cout << "Error: Missing module request for random.\n";
-                    in.close();
-                    cleanup(out);
-                    return 1;
-                }
-                size_t nameStart = line.find("name=\"") + 6;
-                size_t nameEnd = line.find('"', nameStart);
-                string vName = line.substr(nameStart, nameEnd - nameStart);
-
-                size_t minStart = line.find("int(") + 4;
-                size_t minEnd = line.find(")", minStart);
-                string minVal = line.substr(minStart, minEnd - minStart);
-
-                size_t maxStart = line.find("_to_int(") + 8;
-                size_t maxEnd = line.find(")", maxStart);
-                string maxVal = line.substr(maxStart, maxEnd - maxStart);
-
-                out << "    int " << vName << " = rand() % (" << maxVal << " - " << minVal << " + 1) + " << minVal << ";\n";
+                size_t ms = line.find("int(") + 4;
+                size_t me = line.find(")", ms);
+                string mi = line.substr(ms, me - ms);
+                size_t xs = line.find("_to_int(") + 8;
+                size_t xe = line.find(")", xs);
+                string mx = line.substr(xs, xe - xs);
+                out << pad << "int " << vn << " = rand() % (" << mx << " - " << mi << " + 1) + " << mi << ";\n";
+            }
+            else if (line.find("type_var=string_input") != string::npos) {
+                size_t ps = line.find("string_input(\"") + 14;
+                size_t pe = line.find("\")", ps);
+                string pr = line.substr(ps, pe - ps);
+                out << pad << "string " << vn << ";\n";
+                out << pad << "cout << \"" << escapeString(pr) << " \";\n";
+                out << pad << "getline(cin, " << vn << ");\n";
             }
             else if (line.find("type_var=input") != string::npos) {
-                size_t nameStart = line.find("name=\"") + 6;
-                size_t nameEnd = line.find('"', nameStart);
-                string vName = line.substr(nameStart, nameEnd - nameStart);
-
-                size_t promptStart = line.find("input(\"") + 7;
-                size_t promptEnd = line.find("\")", promptStart);
-                string prompt = line.substr(promptStart, promptEnd - promptStart);
-
-                out << "    string " << vName << "_raw;\n";
-                out << "    cout << \"" << escapeString(prompt) << " \";\n";
-                out << "    getline(cin, " << vName << "_raw);\n";
-                out << "    int " << vName << " = atoi(" << vName << "_raw.c_str());\n";
+                size_t ps = line.find("input(\"") + 7;
+                size_t pe = line.find("\")", ps);
+                string pr = line.substr(ps, pe - ps);
+                out << pad << "string " << vn << "_raw;\n";
+                out << pad << "cout << \"" << escapeString(pr) << " \";\n";
+                out << pad << "getline(cin, " << vn << "_raw);\n";
+                out << pad << "int " << vn << " = atoi(" << vn << "_raw.c_str());\n";
+            }
+            else if (line.find("type_var=string(") != string::npos) {
+                size_t vs = line.find("string(\"") + 8;
+                size_t ve = line.find("\")", vs);
+                out << pad << "string " << vn << " = \"" << escapeString(line.substr(vs, ve - vs)) << "\";\n";
+            }
+            else if (line.find("type_var=math") != string::npos) {
+                size_t ms = line.find("math(") + 5;
+                size_t me = line.find(")", ms);
+                out << pad << "int " << vn << " = " << line.substr(ms, me - ms) << ";\n";
             }
             else {
-                size_t nameStart = line.find("name=\"") + 6;
-                size_t nameEnd = line.find('"', nameStart);
-                string vName = line.substr(nameStart, nameEnd - nameStart);
+                size_t vs = line.find('(', ne) + 1;
+                size_t ve = line.find(')', vs);
+                out << pad << "int " << vn << " = " << line.substr(vs, ve - vs) << ";\n";
+            }
+        }
+        else if (line.find("set(") == 0) {
+            size_t ns = line.find("name=\"") + 6;
+            size_t ne = line.find('"', ns);
+            string vn = line.substr(ns, ne - ns);
 
-                size_t valStart = line.find('(', nameEnd) + 1;
-                size_t valEnd = line.find(')', valStart);
-                string vVal = line.substr(valStart, valEnd - valStart);
-                out << "    int " << vName << " = " << vVal << ";\n";
+            if (line.find("type_var=math") != string::npos) {
+                size_t ms = line.find("math(") + 5;
+                size_t me = line.find(")", ms);
+                out << pad << vn << " = " << line.substr(ms, me - ms) << ";\n";
+            }
+            else if (line.find("type_var=input") != string::npos) {
+                size_t ps = line.find("input(\"") + 7;
+                size_t pe = line.find("\")", ps);
+                string pr = line.substr(ps, pe - ps);
+                out << pad << "cout << \"" << escapeString(pr) << " \";\n";
+                out << pad << "getline(cin, " << vn << "_raw);\n";
+                out << pad << vn << " = atoi(" << vn << "_raw.c_str());\n";
+            }
+            else {
+                size_t vs = line.find('(', ne) + 1;
+                size_t ve = line.find(')', vs);
+                out << pad << vn << " = " << line.substr(vs, ve - vs) << ";\n";
             }
         }
         else if (line.find("?(if_type") == 0) {
-            size_t checkStart = line.find("check(\"") + 7;
-            size_t checkMid = line.find("\"=\"", checkStart);
-            size_t checkEnd = line.find("\")", checkMid);
-            string vName = line.substr(checkStart, checkMid - checkStart);
-            string vVal = line.substr(checkMid + 3, checkEnd - checkMid - 3);
-            out << "    if (" << vName << " == " << vVal << ") {\n";
-            braceDepth++;
+            string vn, op, vv;
+            parseCondition(line, vn, op, vv);
+            out << pad << "if (" << vn << " " << op << " " << vv << ") {\n";
+            depth++;
         }
-        else if (line.find("???:") == 0) {
-            if (braceDepth > 0) {
-                out << "    } else {\n";
-            }
+        else if (line.find("loop.while(") == 0) {
+            string vn, op, vv;
+            parseCondition(line, vn, op, vv);
+            out << pad << "while (" << vn << " " << op << " " << vv << ") {\n";
+            depth++;
         }
-        else if (line.find("write(write_type=common.text(\"") != string::npos) {
-            size_t start = line.find("text(\"") + 6;
-            size_t end = line.rfind("\"))");
+        else if (line.find("func.call(") == 0) {
+            size_t ns = line.find("name=\"") + 6;
+            out << pad << line.substr(ns, line.find('"', ns) - ns) << "();\n";
+        }
+        // --- ТОТ САМЫЙ ФИКС ДЛЯ КОНКАТЕНАЦИИ ---
+        else if (line.find("write(write_type=common.text(") != string::npos) {
+            size_t start = line.find("text(") + 5;
+            size_t end = line.rfind("))");
             string content = line.substr(start, end - start);
-            out << "    cout << \"" << escapeString(content) << "\" << endl;\n";
+            
+            string cpp_out = pad + "cout << ";
+            bool in_string = false;
+            string current = "";
+            
+            for (size_t i = 0; i < content.length(); i++) {
+                if (content[i] == '"' && !in_string) {
+                    in_string = true;
+                    cpp_out += current;
+                    current = "\"";
+                } 
+                else if (content[i] == '"' && in_string) {
+                    in_string = false;
+                    current += "\"";
+                    cpp_out += escapeString(current);
+                    current = " << ";
+                }
+                else if (!in_string && isalpha(content[i])) {
+                    string var_name = "";
+                    while (i < content.length() && (isalnum(content[i]) || content[i] == '_')) {
+                        var_name += content[i];
+                        i++;
+                    }
+                    i--;
+                    cpp_out += " << " + var_name + " << ";
+                }
+                else {
+                    current += content[i];
+                }
+            }
+            
+            if (!current.empty()) {
+                if(in_string) cpp_out += escapeString(current);
+                else cpp_out += current;
+            }
+            
+            out << cpp_out << " << endl;\n";
         }
+        // ----------------------------------------
+        else if (line.find("write(write_type=var(") != string::npos) {
+            size_t s = line.find("var(") + 4;
+            size_t e = line.find("))", s);
+            out << pad << "cout << " << line.substr(s, e - s) << " << endl;\n";
+        }
+        else if (line.find("write(write_type=combine(") != string::npos) {
+            size_t pos = line.find("combine(") + 8;
+            size_t end = line.rfind("))");
+            string inner = line.substr(pos, end - pos);
+            out << pad << "cout";
+            string token;
+            bool inQ = false;
+            for (size_t i = 0; i <= inner.size(); i++) {
+                char c = (i < inner.size()) ? inner[i] : ',';
+                if (c == '"') { inQ = !inQ; continue; }
+                if (c == ',' && !inQ) {
+                    trim(token);
+                    if (!token.empty()) {
+                        if (token[0] == '$') out << " << " << token.substr(1);
+                        else out << " << \"" << escapeString(token) << "\"";
+                    }
+                    token.clear();
+                    continue;
+                }
+                token += c;
+            }
+            trim(token);
+            if (!token.empty()) {
+                if (token[0] == '$') out << " << " << token.substr(1);
+                else out << " << \"" << escapeString(token) << "\"";
+            }
+            out << " << endl;\n";
+        }
+    };
+
+    for (size_t i = 0; i < functions.size(); i++) {
+        out << "void " << functions[i].name << "() {\n";
+        depth = 0;
+        for (size_t j = 0; j < functions[i].body.size(); j++)
+            emitLine(functions[i].body[j]);
+        while (depth > 0) { out << "    }\n"; depth--; }
+        out << "}\n\n";
     }
 
-    while (braceDepth > 0) {
-        out << "    }\n";
-        braceDepth--;
-    }
-
+    out << "int main() {\n";
+    depth = 0;
+    for (size_t i = 0; i < mainCode.size(); i++)
+        emitLine(mainCode[i]);
+    while (depth > 0) { out << "    }\n"; depth--; }
     out << "    return 0;\n}\n";
-    in.close();
     out.close();
 
     int result = system(COMPILE);
     system(CLEANUP);
-
-    if (result != 0) {
-        return 1;
-    }
-
-    return 0;
+    return (result != 0) ? 1 : 0;
 }
